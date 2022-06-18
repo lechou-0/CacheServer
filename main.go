@@ -1,0 +1,38 @@
+/*
+ * @Author: lechoux lechoux@qq.com
+ * @Date: 2022-06-16 21:00:28
+ * @LastEditors: lechoux lechoux@qq.com
+ * @LastEditTime: 2022-06-17 03:20:37
+ * @Description:
+ */
+
+package main
+
+import (
+	"fmt"
+
+	"google.golang.org/protobuf/proto"
+	zmq "github.com/pebbe/zmq4"
+
+	pb "wsh/cacheserver/proto"
+)
+
+func main() {
+	zctx, _ := zmq.NewContext()
+
+	// Socket to talk to server
+	fmt.Printf("Connecting to the server...\n")
+	s, _ := zctx.NewSocket(zmq.REQ)
+	s.Connect("tcp://localhost:5555")
+
+	// Do 10 requests, waiting each time for a response
+	for i := 0; i < 10; i++ {
+			fmt.Printf("Sending request %d...\n", i)
+			s.Send("Hello", 0)
+
+			msg, _ := s.Recv(0)
+			fmt.Printf("Received reply %d [ %s ]\n", i, msg)
+	}
+	NewServer()
+
+}
