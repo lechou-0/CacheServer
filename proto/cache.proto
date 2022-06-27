@@ -1,11 +1,35 @@
+/*
+ * @Author: lechoux lechoux@qq.com
+ * @Date: 2022-06-16 21:09:50
+ * @LastEditors: lechoux lechoux@qq.com
+ * @LastEditTime: 2022-06-27 19:45:37
+ * @Description: data formate in transmission
+ */
+
 syntax="proto3";
 
 option go_package = "./";
 
+enum CacheError {
+  // 
+  NO_ERROR = 0;
+
+  KEY_DNE = 1;
+}
+
 message KeyRequest {
     
-    string key = 1;
-    bytes value = 2;
+  string key = 1;
+  bytes value = 2;
+  string response_address = 3;
+
+}
+
+message KeyResponse {
+    
+  string key = 1;
+  bytes value = 2;
+  CacheError error = 3;
 
 }
 

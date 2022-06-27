@@ -2,7 +2,7 @@
  * @Author: lechoux lechoux@qq.com
  * @Date: 2022-06-16 21:08:23
  * @LastEditors: lechoux lechoux@qq.com
- * @LastEditTime: 2022-06-21 23:47:52
+ * @LastEditTime: 2022-06-27 22:16:05
  * @Description:
  */
 
@@ -16,8 +16,25 @@ import (
 
 	pb "wsh/server/proto"
 
+	"github.com/golang/protobuf/proto"
+	proto "github.com/golang/protobuf/proto"
 	uuid "github.com/nu7hatch/gouuid"
+	zmq "github.com/pebbe/zmq4"
 )
+
+type socketCache struct {
+	ctx         zmq.Context
+	pushercache map[string]zmq.Socket
+}
+
+/**
+ * @Author: lechoux lechoux@qq.com
+ * @description: clear push socketcache. Maybe it can be optimized with LRU
+ * @return {*}
+ */
+func (socketcache *socketCache) clear_sockets() {
+	socketcache.pushercache = make(map[string]zmq.Socket)
+}
 
 type CacheServer struct {
 	Id             string
@@ -25,13 +42,14 @@ type CacheServer struct {
 	StorageManager string
 	ReadCache      map[string]pb.KeyValuePair
 	ReadCacheLock  *sync.RWMutex
+	pushers        socketCache
 }
 
 func (s *CacheServer) cache_get_bind_proc() string {
 	return "ipc://requests/get"
 }
 
-func (s *CacheServer) cache_put_bind_proc() string {
+func (s *CacheServer) cache_set_bind_proc() string {
 	return "ipc://requests/put"
 }
 
@@ -39,17 +57,89 @@ func (s *CacheServer) cache_bind_node() string {
 	return "tcp://*:" + strconv.Itoa(s.ResponsePort)
 }
 
-func (s *CacheServer) write() {
-	fmt.Println("1234")
-}
+/**
+ * @Author: lechoux lechoux@qq.com
+ * @description: traverse socket and process W/R request
+ * @param {[]zmq.Polled} sockets
+ * @param {zmq.Socket} get_puller
+ * @param {zmq.Socket} set_puller
+ * @param {zmq.Socket} pusher
+ * @return {*}
+ */
+func (s *CacheServer) execWR(sockets []zmq.Polled, get_puller zmq.Socket, set_puller zmq.Socket) {
+	for _, polled := range sockets {
+		switch s := polled.Socket; s {
+		case get_puller:
+			msg, _ := s.Recv(0)
+			getRequest := &pb.KeyRequest{}
+			getResponse := &pb.KeyResponse{}
+			err := proto.Unmarshal(msg, getRequest)
+			if err != nil {
+				fmt.Println("get unmarshaling error:" + err)
+				break
+			}
+			getResponse.Key = getRequest.GetKey()
 
-func (s *CacheServer) read() {
-	fmt.Println("1234")
+			s.ReadCacheLock.RLock()
+			val, ok := s.ReadCache[getRequest.GetKey()]
+			s.ReadCacheLock.RUnlock()
+
+			if ok {
+				getResponse.Value = val
+				getResponse.Error = pb.CacheError_NO_ERROR
+			} else {
+				getResponse.Error = pb.CacheError_KEY_DNE
+			}
+
+			resp_string, err := proto.Marshal(getResponse)
+			if err != nil {
+				fmt.Println("get marshaling error:" + err)
+				break
+			}
+			endpoint := getRequest.GetResponseAddress()
+			if socket, ok := s.pushers.pushercache[endpoint]; ok {
+				socket.Send(resp_string)
+			} else {
+				pusher := s.pushers.ctx.socket(zmq.PUSH)
+				pusher.Connect(endpoint)
+				s.pushers.pushercache[endpoint] = pusher
+				pusher.Send(resp_string)
+			}
+
+		case set_puller:
+			msg, _ := s.Recv(0)
+			setRequest := &pb.KeyRequest{}
+			err := proto.Unmarshal(msg, setRequest)
+			if err != nil {
+				fmt.Println("set error" + err)
+				break
+			}
+		}
+	}
 }
 
 func (s *CacheServer) Run() {
-	go s.write()
-	go s.read()
+
+	zctx, _ := zmq.NewContext()
+	s.pushers.ctx = zctx
+	defer zctx.Close()
+
+	get_puller := zctx.socket(zmq.PULL)
+	defer get_puller.Close()
+	get_puller.bind(s.cache_get_bind_proc())
+
+	set_puller := zctx.socket(zmq.PULL)
+	defer set_puller.Close()
+	set_puller.bind(s.cache_set_bind_proc())
+
+	socketPoller := zmq.NewPoller()
+	socketPoller.Add(get_puller, zmq.POLLIN)
+	socketPoller.Add(set_puller, zmq.POLLIN)
+
+	for {
+		sockets, _ := socketPoller.Poll(-1)
+		go s.execWR(sockets, get_puller, set_puller)
+	}
 }
 
 func NewServer() *CacheServer {
