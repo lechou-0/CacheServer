@@ -2,7 +2,7 @@
  * @Author: lechoux lechoux@qq.com
  * @Date: 2022-06-16 21:08:23
  * @LastEditors: lechoux lechoux@qq.com
- * @LastEditTime: 2022-06-27 22:16:05
+ * @LastEditTime: 2022-06-27 22:31:43
  * @Description:
  */
 
@@ -78,8 +78,9 @@ func (s *CacheServer) execWR(sockets []zmq.Polled, get_puller zmq.Socket, set_pu
 				fmt.Println("get unmarshaling error:" + err)
 				break
 			}
-			getResponse.Key = getRequest.GetKey()
 
+			getResponse.Key = getRequest.GetKey()
+			// get value from cache
 			s.ReadCacheLock.RLock()
 			val, ok := s.ReadCache[getRequest.GetKey()]
 			s.ReadCacheLock.RUnlock()
@@ -96,6 +97,8 @@ func (s *CacheServer) execWR(sockets []zmq.Polled, get_puller zmq.Socket, set_pu
 				fmt.Println("get marshaling error:" + err)
 				break
 			}
+
+			// send msg by pushercache or new pusher
 			endpoint := getRequest.GetResponseAddress()
 			if socket, ok := s.pushers.pushercache[endpoint]; ok {
 				socket.Send(resp_string)
@@ -109,10 +112,34 @@ func (s *CacheServer) execWR(sockets []zmq.Polled, get_puller zmq.Socket, set_pu
 		case set_puller:
 			msg, _ := s.Recv(0)
 			setRequest := &pb.KeyRequest{}
+			setResponse := &pb.KeyResponse{}
 			err := proto.Unmarshal(msg, setRequest)
 			if err != nil {
-				fmt.Println("set error" + err)
+				fmt.Println("set unmarshaling error" + err)
 				break
+			}
+
+			s.ReadCacheLock.RLock()
+			s.ReadCache[setRequest.GetKey()] = setRequest.GetValue()
+			s.ReadCacheLock.RUnlock()
+
+			setResponse.Error = pb.CacheError_NO_ERROR
+
+			resp_string, err := proto.Marshal(setResponse)
+			if err != nil {
+				fmt.Println("set marshaling error:" + err)
+				break
+			}
+
+			// send msg by pushercache or new pusher
+			endpoint := setRequest.GetResponseAddress()
+			if socket, ok := s.pushers.pushercache[endpoint]; ok {
+				socket.Send(resp_string)
+			} else {
+				pusher := s.pushers.ctx.socket(zmq.PUSH)
+				pusher.Connect(endpoint)
+				s.pushers.pushercache[endpoint] = pusher
+				pusher.Send(resp_string)
 			}
 		}
 	}
