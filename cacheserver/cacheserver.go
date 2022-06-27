@@ -2,47 +2,37 @@
  * @Author: lechoux lechoux@qq.com
  * @Date: 2022-06-16 21:08:23
  * @LastEditors: lechoux lechoux@qq.com
- * @LastEditTime: 2022-06-27 22:31:43
+ * @LastEditTime: 2022-06-28 00:16:56
  * @Description:
  */
 
 package cacheserver
 
 import (
-	"fmt"
 	"log"
 	"strconv"
 	"sync"
 
 	pb "wsh/server/proto"
+	"wsh/server/util"
 
-	"github.com/golang/protobuf/proto"
-	proto "github.com/golang/protobuf/proto"
 	uuid "github.com/nu7hatch/gouuid"
 	zmq "github.com/pebbe/zmq4"
 )
-
-type socketCache struct {
-	ctx         zmq.Context
-	pushercache map[string]zmq.Socket
-}
 
 /**
  * @Author: lechoux lechoux@qq.com
  * @description: clear push socketcache. Maybe it can be optimized with LRU
  * @return {*}
  */
-func (socketcache *socketCache) clear_sockets() {
-	socketcache.pushercache = make(map[string]zmq.Socket)
-}
 
 type CacheServer struct {
 	Id             string
 	ResponsePort   int
 	StorageManager string
-	ReadCache      map[string]pb.KeyValuePair
+	ReadCache      map[string]*pb.KeyValuePair
 	ReadCacheLock  *sync.RWMutex
-	pushers        socketCache
+	pushers        *util.SocketCache
 }
 
 func (s *CacheServer) cache_get_bind_proc() string {
@@ -66,19 +56,16 @@ func (s *CacheServer) cache_bind_node() string {
  * @param {zmq.Socket} pusher
  * @return {*}
  */
-func (s *CacheServer) execWR(sockets []zmq.Polled, get_puller zmq.Socket, set_puller zmq.Socket) {
+func (s *CacheServer) execWR(sockets []zmq.Polled, get_puller *zmq.Socket, set_puller *zmq.Socket) {
 	for _, polled := range sockets {
-		switch s := polled.Socket; s {
+		switch socket := polled.Socket; socket {
 		case get_puller:
-			msg, _ := s.Recv(0)
-			getRequest := &pb.KeyRequest{}
-			getResponse := &pb.KeyResponse{}
-			err := proto.Unmarshal(msg, getRequest)
+			getRequest, err := util.RecvMsg(socket)
 			if err != nil {
-				fmt.Println("get unmarshaling error:" + err)
+				log.Printf("Unexpected error while receiving get message: %v", err)
 				break
 			}
-
+			getResponse := &pb.KeyResponse{}
 			getResponse.Key = getRequest.GetKey()
 			// get value from cache
 			s.ReadCacheLock.RLock()
@@ -86,60 +73,39 @@ func (s *CacheServer) execWR(sockets []zmq.Polled, get_puller zmq.Socket, set_pu
 			s.ReadCacheLock.RUnlock()
 
 			if ok {
-				getResponse.Value = val
+				getResponse.Value = val.GetValue()
 				getResponse.Error = pb.CacheError_NO_ERROR
 			} else {
 				getResponse.Error = pb.CacheError_KEY_DNE
 			}
 
-			resp_string, err := proto.Marshal(getResponse)
-			if err != nil {
-				fmt.Println("get marshaling error:" + err)
-				break
-			}
-
 			// send msg by pushercache or new pusher
 			endpoint := getRequest.GetResponseAddress()
-			if socket, ok := s.pushers.pushercache[endpoint]; ok {
-				socket.Send(resp_string)
-			} else {
-				pusher := s.pushers.ctx.socket(zmq.PUSH)
-				pusher.Connect(endpoint)
-				s.pushers.pushercache[endpoint] = pusher
-				pusher.Send(resp_string)
+			err = s.pushers.SendMsg(getResponse, zmq.PUSH, endpoint)
+			if err != nil {
+				log.Printf("Unexpected error while sending get message: %v", err)
 			}
 
 		case set_puller:
-			msg, _ := s.Recv(0)
-			setRequest := &pb.KeyRequest{}
-			setResponse := &pb.KeyResponse{}
-			err := proto.Unmarshal(msg, setRequest)
+			setRequest, err := util.RecvMsg(socket)
 			if err != nil {
-				fmt.Println("set unmarshaling error" + err)
+				log.Printf("Unexpected error while receiving set message: %v", err)
 				break
 			}
 
+			kv := &pb.KeyValuePair{Value: setRequest.GetValue()}
 			s.ReadCacheLock.RLock()
-			s.ReadCache[setRequest.GetKey()] = setRequest.GetValue()
+			s.ReadCache[setRequest.GetKey()] = kv
 			s.ReadCacheLock.RUnlock()
 
+			setResponse := &pb.KeyResponse{}
 			setResponse.Error = pb.CacheError_NO_ERROR
-
-			resp_string, err := proto.Marshal(setResponse)
-			if err != nil {
-				fmt.Println("set marshaling error:" + err)
-				break
-			}
 
 			// send msg by pushercache or new pusher
 			endpoint := setRequest.GetResponseAddress()
-			if socket, ok := s.pushers.pushercache[endpoint]; ok {
-				socket.Send(resp_string)
-			} else {
-				pusher := s.pushers.ctx.socket(zmq.PUSH)
-				pusher.Connect(endpoint)
-				s.pushers.pushercache[endpoint] = pusher
-				pusher.Send(resp_string)
+			err = s.pushers.SendMsg(setResponse, zmq.PUSH, endpoint)
+			if err != nil {
+				log.Printf("Unexpected error while sending get message: %v", err)
 			}
 		}
 	}
@@ -147,24 +113,30 @@ func (s *CacheServer) execWR(sockets []zmq.Polled, get_puller zmq.Socket, set_pu
 
 func (s *CacheServer) Run() {
 
-	zctx, _ := zmq.NewContext()
-	s.pushers.ctx = zctx
-	defer zctx.Close()
+	zctx, err := zmq.NewContext()
+	if err != nil {
+		log.Fatalf("Unexpected error while creating zmq context: %v", err)
+	}
+	s.pushers.Ctx = zctx
+	defer zctx.Term()
 
-	get_puller := zctx.socket(zmq.PULL)
+	get_puller, _ := zctx.NewSocket(zmq.PULL)
 	defer get_puller.Close()
-	get_puller.bind(s.cache_get_bind_proc())
+	get_puller.Bind(s.cache_get_bind_proc())
 
-	set_puller := zctx.socket(zmq.PULL)
+	set_puller, _ := zctx.NewSocket(zmq.PULL)
 	defer set_puller.Close()
-	set_puller.bind(s.cache_set_bind_proc())
+	set_puller.Bind(s.cache_set_bind_proc())
 
 	socketPoller := zmq.NewPoller()
 	socketPoller.Add(get_puller, zmq.POLLIN)
 	socketPoller.Add(set_puller, zmq.POLLIN)
 
 	for {
-		sockets, _ := socketPoller.Poll(-1)
+		sockets, err := socketPoller.Poll(-1)
+		if err != nil {
+			log.Printf("Unexpected error while processing poller: %v", err)
+		}
 		go s.execWR(sockets, get_puller, set_puller)
 	}
 }
@@ -177,9 +149,10 @@ func NewServer() *CacheServer {
 	server := &CacheServer{
 		Id:            uid.String(),
 		ResponsePort:  5555,
-		ReadCache:     map[string]pb.KeyValuePair{},
+		ReadCache:     map[string]*pb.KeyValuePair{},
 		ReadCacheLock: &sync.RWMutex{},
+		pushers:       &util.SocketCache{},
 	}
-	fmt.Println("init success")
+	log.Println("init success")
 	return server
 }
